@@ -149,7 +149,7 @@ object FileFormatWriter extends Logging {
     )
 
     // We should first sort by partition columns, then bucket id, and finally sorting columns.
-    val requiredOrdering = partitionColumns ++ bucketIdExpression ++ sortColumns
+    val requiredOrdering = sortColumns
     // the sort order doesn't matter
     val actualOrdering = empty2NullPlan.outputOrdering.map(_.child)
     val orderingMatched = if (requiredOrdering.length > actualOrdering.length) {
@@ -263,7 +263,7 @@ object FileFormatWriter extends Logging {
       } else if (description.partitionColumns.isEmpty && description.bucketIdExpression.isEmpty) {
         new SingleDirectoryDataWriter(description, taskAttemptContext, committer)
       } else {
-        new DynamicPartitionDataWriter(description, taskAttemptContext, committer)
+        new DynamicPartitionDataWriterV2(description, taskAttemptContext, committer)
       }
 
     try {

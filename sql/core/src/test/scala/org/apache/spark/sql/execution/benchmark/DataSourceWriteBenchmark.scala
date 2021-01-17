@@ -54,7 +54,7 @@ trait DataSourceWriteBenchmark extends SqlBasedBenchmark {
     spark.sql(s"CREATE TABLE $table(p INT, id INT) USING $format PARTITIONED BY (p)")
     benchmark.addCase("Output Partitions") { _ =>
       spark.sql(s"INSERT OVERWRITE TABLE $table SELECT CAST(id AS INT) AS id," +
-        s" CAST(id % 2 AS INT) AS p FROM $tempTable")
+        s" CAST(id % 8 AS INT) AS p FROM $tempTable")
     }
   }
 

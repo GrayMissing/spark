@@ -277,6 +277,169 @@ class DynamicPartitionDataWriter(
   }
 }
 
+class DynamicPartitionDataWriterV2(
+    description: WriteJobDescription,
+    taskAttemptContext: TaskAttemptContext,
+    committer: FileCommitProtocol)
+  extends FileFormatDataWriter(description, taskAttemptContext, committer) {
+
+  /** Flag saying whether or not the data to be written out is partitioned. */
+  private val isPartitioned = description.partitionColumns.nonEmpty
+
+  /** Flag saying whether or not the data to be written out is bucketed. */
+  private val isBucketed = description.bucketIdExpression.isDefined
+
+  assert(isPartitioned || isBucketed,
+    s"""DynamicPartitionWriteTask should be used for writing out data that's either
+       |partitioned or bucketed. In this case neither is true.
+       |WriteJobDescription: $description
+       """.stripMargin)
+
+  case class OutputWriterKey(partitionValues: Option[InternalRow],
+                             bucketId: Option[Int]) {
+
+    private val code: Int = partitionValues.hashCode() + bucketId.hashCode()
+    override def hashCode(): Int = code
+
+    override def equals(obj: Any): Boolean = {
+      obj match {
+        case other: OutputWriterKey =>
+          partitionValues == other.partitionValues && bucketId == other.bucketId
+        case _ => false
+      }
+    }
+  }
+
+  private var fileCounter: Int = _
+  private val recordsInFile: mutable.Map[OutputWriterKey, Long]
+    = mutable.Map[OutputWriterKey, Long]()
+  private var currentOutputWriters: mutable.Map[OutputWriterKey, OutputWriter]
+    = mutable.Map[OutputWriterKey, OutputWriter]()
+
+  /** Extracts the partition values out of an input row. */
+  private lazy val getPartitionValues: InternalRow => UnsafeRow = {
+    val proj = UnsafeProjection.create(description.partitionColumns, description.allColumns)
+    row => proj(row)
+  }
+
+  /** Expression that given partition columns builds a path string like: col1=val/col2=val/... */
+  private lazy val partitionPathExpression: Expression = Concat(
+    description.partitionColumns.zipWithIndex.flatMap { case (c, i) =>
+      val partitionName = ScalaUDF(
+        ExternalCatalogUtils.getPartitionPathString _,
+        StringType,
+        Seq(Literal(c.name), Cast(c, StringType, Option(description.timeZoneId))))
+      if (i == 0) Seq(partitionName) else Seq(Literal(Path.SEPARATOR), partitionName)
+    })
+
+  /** Evaluates the `partitionPathExpression` above on a row of `partitionValues` and returns
+   * the partition string. */
+  private lazy val getPartitionPath: InternalRow => String = {
+    val proj = UnsafeProjection.create(Seq(partitionPathExpression), description.partitionColumns)
+    row => proj(row).getString(0)
+  }
+
+  /** Given an input row, returns the corresponding `bucketId` */
+  private lazy val getBucketId: InternalRow => Int = {
+    val proj =
+      UnsafeProjection.create(description.bucketIdExpression.toSeq, description.allColumns)
+    row => proj(row).getInt(0)
+  }
+
+  /** Returns the data columns to be written given an input row */
+  private val getOutputRow =
+    UnsafeProjection.create(description.dataColumns, description.allColumns)
+
+  override protected def releaseResources(): Unit = {
+    val openedWriters = currentOutputWriters.values.iterator
+    while (openedWriters.hasNext) {
+      val writer = openedWriters.next()
+      writer.close()
+    }
+    currentOutputWriters.clear()
+  }
+
+  private def getOutputWriterKey(
+    partitionValues: Option[InternalRow],
+    bucketId: Option[Int]): OutputWriterKey = {
+    OutputWriterKey(partitionValues, bucketId)
+  }
+
+  private def getOrCreateOutputWriter(outputWriterKey: OutputWriterKey): OutputWriter = {
+    if (!currentOutputWriters.contains(outputWriterKey)) {
+      val newWriter = newOutputWriter(outputWriterKey)
+      currentOutputWriters.put(outputWriterKey, newWriter)
+      return newWriter
+    }
+
+    if (description.maxRecordsPerFile > 0 &&
+      recordsInFile(outputWriterKey) >= description.maxRecordsPerFile) {
+      val currentWriter = currentOutputWriters(outputWriterKey)
+      currentWriter.close()
+
+      val newWriter = newOutputWriter(outputWriterKey)
+      currentOutputWriters.put(outputWriterKey, newWriter)
+      return newWriter
+    }
+
+    currentOutputWriters(outputWriterKey)
+  }
+
+  /**
+   * Opens a new OutputWriter given a partition key and/or a bucket id.
+   * If bucket id is specified, we will append it to the end of the file name, but before the
+   * file extension, e.g. part-r-00009-ea518ad4-455a-4431-b471-d24e03814677-00002.gz.parquet
+   *
+   * @param partitionValues the partition which all tuples being written by this `OutputWriter`
+   *                        belong to
+   * @param bucketId the bucket which all tuples being written by this `OutputWriter` belong to
+   */
+  private def newOutputWriter(outputWriterKey: OutputWriterKey): OutputWriter = {
+    // Exceeded the threshold in terms of the number of records per file.
+    // Create a new file by increasing the file counter.
+    fileCounter += 1
+    assert(fileCounter < MAX_FILE_COUNTER,
+      s"File counter $fileCounter is beyond max value $MAX_FILE_COUNTER")
+    recordsInFile.put(outputWriterKey, 0)
+
+    val partDir = outputWriterKey.partitionValues.map(getPartitionPath(_))
+    val bucketIdStr = outputWriterKey.bucketId.map(BucketingUtils.bucketIdToString).getOrElse("")
+
+    partDir.foreach(updatedPartitions.add)
+
+    // This must be in a form that matches our bucketing format. See BucketingUtils.
+    val ext = f"$bucketIdStr.c$fileCounter%03d" +
+      description.outputWriterFactory.getFileExtension(taskAttemptContext)
+
+    val customPath = partDir.flatMap { dir =>
+      description.customPartitionLocations.get(PartitioningUtils.parsePathFragment(dir))
+    }
+    val currentPath = if (customPath.isDefined) {
+      committer.newTaskTempFileAbsPath(taskAttemptContext, customPath.get, ext)
+    } else {
+      committer.newTaskTempFile(taskAttemptContext, partDir, ext)
+    }
+
+    currentWriter = description.outputWriterFactory.newInstance(
+      path = currentPath,
+      dataSchema = description.dataColumns.toStructType,
+      context = taskAttemptContext)
+    currentWriter
+  }
+
+  override def write(record: InternalRow): Unit = {
+    val partitionValues = if (isPartitioned) Some(getPartitionValues(record)) else None
+    val bucketId = if (isBucketed) Some(getBucketId(record)) else None
+
+    val outputWriterKey = getOutputWriterKey(partitionValues, bucketId)
+    val writer = getOrCreateOutputWriter(outputWriterKey)
+
+    val outputRow = getOutputRow(record)
+    writer.write(outputRow)
+    recordsInFile(outputWriterKey) += 1
+  }
+}
+
 /** A shared job description for all the write tasks. */
 class WriteJobDescription(
     val uuid: String, // prevent collision between different (appending) write jobs
